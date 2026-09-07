@@ -33,6 +33,7 @@ static lv_obj_t *text_label = nullptr;
 static lv_obj_t *status_label = nullptr;
 
 LV_FONT_DECLARE(font_ptbr_20);
+LV_FONT_DECLARE(lv_font_montserrat_14);
 
 // =====================================================
 // COMMAND TYPES
@@ -365,9 +366,12 @@ static void eye_animation_task(void *arg)
     lv_obj_set_style_text_color(text_label, lv_color_white(), 0);
 
     status_label = lv_label_create(text_overlay);
-    lv_label_set_text(status_label, "READY");
-    lv_obj_align_to(status_label, text_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 5);
-    lv_obj_set_style_text_font(status_label, &font_ptbr_20, 0);
+    lv_label_set_text(status_label, "INICIANDO");
+    lv_label_set_long_mode(status_label, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(status_label, LV_PCT(100));
+    lv_obj_align(status_label, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_text_align(status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(status_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(status_label, lv_color_white(), 0);
 
     ESP_LOGI(TAG, "Eye animation ready");

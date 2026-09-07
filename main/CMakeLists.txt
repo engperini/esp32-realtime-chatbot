@@ -12,6 +12,7 @@ idf_component_register(
         esp_netif
         esp_websocket_client
         nvs_flash
+        device_config
         driver
         esp_timer
         mbedtls

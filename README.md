@@ -378,57 +378,46 @@ The current JSON completeness logic counts `{` and `}` characters. Braces appear
 
 Wi-Fi SSID/password and OpenAI API configuration should not require editing source code and reflashing firmware whenever the device changes network or credentials.
 
-### Planned boot behavior
+### Implemented boot behavior
 
 ```text
-Read configuration from NVS
+Read Wi-Fi + API configuration from NVS
         |
-        +-- valid Wi-Fi config -> attempt STA connection
+        +-- valid configuration -> attempt STA connection
         |                         |
         |                         +-- success -> start Realtime client
         |                         |
-        |                         +-- repeated failure -> setup mode
+        |                         +-- 5 failed attempts -> setup mode
         |
         +-- no configuration -> setup mode
 ```
 
 ### Setup mode
 
-ESP32 creates a temporary access point, for example:
+The firmware starts a WPA2-protected temporary SoftAP with a device-specific SSID:
 
 ```text
-SSID: ESP32-Realtime-Setup
+SSID: ESP32-Realtime-XXXX
+IP:   192.168.4.1
 ```
 
-The user connects with a phone/computer and opens a local configuration page/captive portal.
+The temporary password is generated for each setup session and displayed only on the device screen. Captive DNS directs connected clients to the local portal, which collects:
 
-Planned fields:
-
-- Wi-Fi network / SSID.
-- Wi-Fi password.
+- Wi-Fi SSID;
+- Wi-Fi password (including an empty password for open networks);
 - OpenAI API key.
-- Optional device name.
 
-Planned actions:
-
-- Scan nearby Wi-Fi networks.
-- Save settings to NVS.
-- Validate required fields.
-- Restart/connect using the new configuration.
-- Reopen setup mode later without reflashing.
-- Factory/configuration reset mechanism to erase saved Wi-Fi/API credentials.
+The API key is never returned by the portal or printed in logs. On a successful save, the device commits all values to NVS and restarts into STA mode.
 
 ### Storage
 
-Use NVS namespaces instead of compile-time `#define` credentials.
-
-Credentials must never be printed in normal logs.
+Configuration is stored in the `chatbot_cfg` NVS namespace under separate Wi-Fi SSID, Wi-Fi password and API-key entries. No Wi-Fi or API credential remains as a compile-time source macro.
 
 ### API-key security
 
-For the current personal prototype, storing the API key locally in NVS is the simplest serverless approach.
+For the current personal prototype, storing the API key locally in NVS is the simplest serverless approach. The setup AP is WPA2-protected and uses a fresh random password per setup session.
 
-For a future product distributed to other users, do **not** ship a permanent OpenAI API key in firmware. Evaluate an ephemeral-token/bootstrap architecture where a minimal trusted service issues temporary credentials while the actual Realtime audio connection remains direct from device to OpenAI.
+For a future product distributed to other users, do **not** ship a permanent OpenAI API key in firmware. Use encrypted NVS/flash encryption and evaluate an ephemeral-token/bootstrap architecture where a minimal trusted service issues temporary credentials while the actual Realtime audio connection remains direct from device to OpenAI.
 
 ---
 

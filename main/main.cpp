@@ -59,9 +59,11 @@
 
 #include "esp_wifi.h"
 #include "esp_netif.h"
+#include "device_config.hpp"
 
 #include "esp_websocket_client.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 
 #include "driver/gpio.h"
 #include "esp_timer.h"
@@ -72,15 +74,8 @@
 #include "driver/i2s_pdm.h"
 #include "driver/i2s_std.h" //new was i2s
 
-// =================== CONFIG ===================
-#define WIFI_SSID "...."
-#define WIFI_PASS "..."
-
-// 
-#define OPENAI_KEY "...."
-
 // Model Realtime
-#define REALTIME_URI "wss://api.openai.com/v1/realtime?model=gpt-realtime-mini-2025-12-15"
+#define REALTIME_URI "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1"
 
 // Mic PDM RX (XIAO ESP32-S3 SENSE)
 #define I2S_PDM_CLK GPIO_NUM_42
@@ -94,8 +89,9 @@
 #define AUDIO_SAMPLE_RATE 24000
 
 // Mic frames
-#define MIC_FRAME_BYTES   2048
+#define MIC_FRAME_BYTES   9600
 #define MIC_QUEUE_LEN     8
+#define RMS_HOLD_US       300000
 
 // Playback queue
 #define AUDIO_QUEUE_LEN   50
@@ -114,6 +110,15 @@ static int32_t rms = 0;
 #define WS_ACCUM_MAX 65536
 
 static const char *TAG = "RT_MIN";
+
+static void log_tls_memory(const char *phase)
+{
+    const uint32_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const uint32_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const uint32_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG, "TLS MEM %s: internal=%" PRIu32 " largest=%" PRIu32 " psram=%" PRIu32,
+             phase, internal_free, internal_largest, psram_free);
+}
 
 // =================== APP STATE ===================
 typedef enum {
@@ -134,8 +139,21 @@ static void app_set_state(app_state_t s) {
 
 // =================== GLOBALS ===================
 static volatile bool ws_connected = false;
+static volatile bool session_ready = false;
 static bool ws_started = false;
 static esp_websocket_client_handle_t client = NULL;
+static volatile uint32_t ws_audio_frames_sent = 0;
+static volatile uint32_t ws_audio_frames_backpressure = 0;
+static volatile uint32_t ws_audio_frames_dropped = 0;
+static volatile uint32_t mic_frames_captured = 0;
+static volatile uint32_t mic_frames_queued = 0;
+static volatile uint32_t mic_queue_drops = 0;
+static volatile uint32_t mic_frames_encoded = 0;
+static device_config_t runtime_config = {};
+static char websocket_headers[DEVICE_CONFIG_API_KEY_MAX_LEN + 96] = {};
+static bool portal_active = false;
+static uint8_t wifi_retry_count = 0;
+constexpr uint8_t WIFI_MAX_RETRIES = 5;
 
 // I2S handles
 static i2s_chan_handle_t rx_handle = NULL;
@@ -228,36 +246,54 @@ static void send_ws_audio_append(const char *b64)
 {
     if (!client || !ws_connected || !b64) return;
 
-    cJSON *msg = cJSON_CreateObject();
-    cJSON_AddStringToObject(msg, "type", "input_audio_buffer.append");
-    cJSON_AddStringToObject(msg, "audio", b64);
-
-    char *json = cJSON_PrintUnformatted(msg);
-    esp_websocket_client_send_text(client, json, strlen(json), portMAX_DELAY);
-
-    cJSON_Delete(msg);
-    free(json);
+    const size_t json_size = strlen(b64) + 48;
+    char *json = static_cast<char *>(heap_caps_malloc(json_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (json == nullptr) {
+        ESP_LOGE(TAG, "Falha ao alocar mensagem de áudio");
+        return;
+    }
+    snprintf(json, json_size, "{\"type\":\"input_audio_buffer.append\",\"audio\":\"%s\"}", b64);
+    const int json_len = strlen(json);
+    for (int tentativa = 0; tentativa <= 2; ++tentativa) {
+        const int sent = esp_websocket_client_send_text(client, json, json_len, 100);
+        if (sent == json_len) {
+            ++ws_audio_frames_sent;
+            heap_caps_free(json);
+            return;
+        }
+        ++ws_audio_frames_backpressure;
+        if (tentativa < 2) vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    ++ws_audio_frames_dropped;
+    ESP_LOGW(TAG, "Frame de áudio descartado após backpressure");
+    heap_caps_free(json);
 }
 
-// ===== session.update (server vad) =====
-// Importante: input_audio_format/output_audio_format pcm16
+// ===== session.update (Realtime GA, server VAD) =====
 static void ws_send_session_update(void)
 {
     const char *msg =
         "{"
           "\"type\":\"session.update\","
           "\"session\":{"
+            "\"type\":\"realtime\","
+            "\"model\":\"gpt-realtime-2.1\","
             "\"instructions\":\"O seu nome é EVA.  Sempre responda em português usando linguagem simples, frases curtas e no máximo três frases por resposta. Fale de forma alegre, gentil e protetora, como uma robô amiga. Só responda se o áudio estiver claro; se não estiver, diga apenas que não entendeu e peça para falar de novo. Quando a criança pedir uma história, conte histórias infantis felizes e imaginativas, em partes curtas, uma parte por vez, perguntando ao final se quer ouvir a próxima parte. Use frases fixas como Quer ouvir uma história? Se o user pedir curiosidades, responda com curiosidades simples e divertidas sobre animais, espaço, robôs, cores, natureza ou amizade, sem explicar como você pesquisou.\","
-            "\"voice\":\"marin\","
-            "\"input_audio_format\":\"pcm16\","
-            "\"output_audio_format\":\"pcm16\","
-            "\"turn_detection\":{"
-              "\"type\":\"server_vad\","
-              "\"threshold\": 0.8,"
-              "\"prefix_padding_ms\": 300,"
-              "\"silence_duration_ms\": 1000,"
-              "\"create_response\": false,"
-              "\"interrupt_response\": true"
+            "\"output_modalities\":[\"audio\"],"
+            "\"audio\":{"
+              "\"input\":{"
+                "\"format\":{\"type\":\"audio/pcm\",\"rate\":24000},"
+                "\"turn_detection\":{"
+                  "\"type\":\"server_vad\","
+                  "\"threshold\":0.8,"
+                  "\"prefix_padding_ms\":300,"
+                  "\"silence_duration_ms\":1000"
+                "}"
+              "},"
+              "\"output\":{"
+                "\"format\":{\"type\":\"audio/pcm\",\"rate\":24000},"
+                "\"voice\":\"marin\""
+              "}"
             "}"
           "}"
         "}";
@@ -275,7 +311,7 @@ static void ws_send_response_create(void)
           "\"type\":\"response.create\","
           "\"response\":{"
             "\"instructions\":\"\","
-            "\"modalities\":[\"audio\",\"text\"]"
+            "\"output_modalities\":[\"audio\"]"
           "}"
         "}";
 
@@ -494,6 +530,7 @@ static void mic_capture_task(void *arg)
             heap_caps_free(chunk.pcm);
             continue;
         }
+        ++mic_frames_captured;
 
         //bloco detection start
         int16_t *samples = (int16_t *)chunk.pcm;
@@ -519,17 +556,11 @@ static void mic_capture_task(void *arg)
 
        
         
-        #define RMS_HOLD_US   300000  // 300 ms
-
         if (rms > DINAM_VAD_THRESHOLD_ON) {
             user_speaking = true;
             last_voice_ts = now;
-        } else {
-            // hold simples para não oscilar
-            //if ((now - last_voice_ts) > RMS_HOLD_US) {
-                
-                user_speaking = false;
-            //}
+        } else if ((now - last_voice_ts) > RMS_HOLD_US) {
+            user_speaking = false;
         }
 
         // static int dbg = 0;
@@ -555,15 +586,15 @@ static void mic_capture_task(void *arg)
         }
 
         
-        // Sempre enfileira (mic sempre ativo)
-        
-        if (mic_queue) {
+        // Envia voz detectada e uma pequena cauda; silêncio não congestiona o TLS.
+        if (ws_connected && session_ready && user_speaking && mic_queue) {
             if (xQueueSend(mic_queue, &chunk, pdMS_TO_TICKS(50)) != pdTRUE) {
+                ++mic_queue_drops;
                 heap_caps_free(chunk.pcm);
+            } else {
+                ++mic_frames_queued;
             }
-        } 
-        
-        else {
+        } else {
             heap_caps_free(chunk.pcm);
         }
     }
@@ -597,6 +628,7 @@ static void mic_encode_send_task(void *arg)
                     chunk.len
                 );
                 b64[b64_len] = 0;
+                ++mic_frames_encoded;
 
                 send_ws_audio_append(b64);
                 heap_caps_free(b64);
@@ -619,23 +651,35 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base, int32_t eve
             
 
             ws_connected = true;
+            session_ready = false;
+            if (mic_queue) xQueueReset(mic_queue);
             app_set_state(APP_IDLE);
-            ws_send_session_update();
-            //display
+            // display
             display_set_state_idle();
-            display_set_text("Ready...");
+            eye_set_text("CONECTANDO");
+            eye_set_status("CONFIGURANDO");
             break;
 
         case WEBSOCKET_EVENT_DISCONNECTED:
             ESP_LOGW(TAG, "WS DISCONNECTED");
             ws_connected = false;
+            session_ready = false;
+            if (mic_queue) xQueueReset(mic_queue);
             app_set_state(APP_IDLE);
             current_response_id[0] = 0;
             model_speaking = false;
             playback_abort = false;
+            if (!portal_active) {
+                eye_set_text("SEM LLM");
+                eye_set_status("CONECTANDO");
+            }
             break;
 
         case WEBSOCKET_EVENT_DATA: {
+            if (data == nullptr || data->data_ptr == nullptr || data->data_len <= 0) {
+                ESP_LOGW(TAG, "WebSocket recebeu quadro vazio");
+                break;
+            }
             if (ws_accum_len + data->data_len >= WS_ACCUM_MAX) {
                 ESP_LOGE(TAG, "WS buffer overflow, resetando");
                 ws_accum_len = 0;
@@ -663,11 +707,24 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base, int32_t eve
             cJSON *type = cJSON_GetObjectItem(root, "type");
             if (cJSON_IsString(type)) {
 
+                if (strcmp(type->valuestring, "session.created") == 0) {
+                    ESP_LOGI(TAG, "SESSION CREATED");
+                    ws_send_session_update();
+                }
+                else if (strcmp(type->valuestring, "session.updated") == 0) {
+                    ESP_LOGI(TAG, "SESSION UPDATED");
+                    session_ready = true;
+                    eye_set_text("CONECTADO");
+                    eye_set_status("API ONLINE");
+                }
+
                 // ===== SERVER VAD =====
-                if (strcmp(type->valuestring, "input_audio_buffer.speech_started") == 0) {
+                else if (strcmp(type->valuestring, "input_audio_buffer.speech_started") == 0) {
                     ESP_LOGI(TAG, "SERVER VAD: speech_started");
                     app_set_state(APP_LISTENING);
                     display_set_state_listening();
+                    eye_set_text("OUVINDO");
+                    eye_set_status("ENVIANDO");
 
 
 
@@ -691,16 +748,8 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base, int32_t eve
                     app_set_state(APP_THINKING);
 
                     
-                    if (!cancel_sent_for_response) {
-
-                        ws_send_response_create();  //apenas se desabilitado dentro do parametro do update
-
-                    };
-                    
-                    
-
-                    // Agora sim: pedir resposta
-                    playback_abort = false;          // libera tocar a próxima resposta
+                    // A resposta é criada automaticamente pelo VAD do servidor.
+                    playback_abort = false;
                     
 
 
@@ -730,7 +779,7 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base, int32_t eve
                 }
 
                 // Transcrição do áudio do modelo (opcional, só log)
-                else if (strcmp(type->valuestring, "response.audio_transcript.delta") == 0) {
+                else if (strcmp(type->valuestring, "response.output_audio_transcript.delta") == 0) {
                     cJSON *delta = cJSON_GetObjectItem(root, "delta");
                     if (cJSON_IsString(delta)) {
                         ESP_LOGI(TAG, "ASR: %s", delta->valuestring);
@@ -740,7 +789,7 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base, int32_t eve
                 }
 
                 // ===== AUDIO OUT =====
-                else if (strcmp(type->valuestring, "response.audio.delta") == 0) {
+                else if (strcmp(type->valuestring, "response.output_audio.delta") == 0) {
                     cJSON *delta = cJSON_GetObjectItem(root, "delta");
                     cJSON *item_id = cJSON_GetObjectItem(root, "item_id");
 
@@ -759,6 +808,8 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base, int32_t eve
                         model_speaking = true;
                         app_set_state(APP_SPEAKING);
                         display_set_state_speaking();
+                        eye_set_text("RESPONDENDO");
+                        eye_set_status("FALANDO");
 
                         // toca
                         play_audio_base64_pcm16(delta->valuestring);
@@ -766,8 +817,8 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base, int32_t eve
 
                 }
 
-                else if (strcmp(type->valuestring, "response.audio.done") == 0) {
-                    ESP_LOGI(TAG, "response.audio.done");
+                else if (strcmp(type->valuestring, "response.output_audio.done") == 0) {
+                    ESP_LOGI(TAG, "response.output_audio.done");
                     // ainda pode vir response.done em seguida
                     audio_item_started = false;
                     
@@ -778,6 +829,8 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base, int32_t eve
                     model_speaking = false;
                     app_set_state(APP_IDLE);
                     display_set_state_idle();
+                    eye_set_text("CONECTADO");
+                    eye_set_status("API ONLINE");
                     current_response_id[0] = 0;
                     audio_item_started = false;
                     cancel_sent_for_response = false; 
@@ -834,7 +887,10 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base, int32_t eve
         case WEBSOCKET_EVENT_ERROR:
             ESP_LOGE(TAG, "WS EVENT ERROR");
             model_speaking = false;
-            
+            if (!portal_active) {
+                eye_set_text("SEM LLM");
+                eye_set_status("CONECTANDO");
+            }
             break;
 
         default:
@@ -843,6 +899,25 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base, int32_t eve
 }
 
 // =================== WIFI HANDLERS ===================
+static void portal_status_callback(const char *message)
+{
+    eye_set_text(message);
+}
+
+static void enter_portal_mode(void)
+{
+    if (portal_active) return;
+    portal_active = true;
+    if (client) esp_websocket_client_stop(client);
+    ws_started = false;
+    ws_connected = false;
+    app_set_state(APP_IDLE);
+
+    ESP_ERROR_CHECK(device_config_start_portal(portal_status_callback));
+    eye_set_text("Wi-Fi: esp32s3");
+    eye_set_status("IP 192.168.4.1");
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
@@ -852,16 +927,16 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     }
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "WIFI_DISCONNECTED -> stop WS and reconnect WiFi");
-
-        if (client) {
-            esp_websocket_client_stop(client);
+        if (++wifi_retry_count >= WIFI_MAX_RETRIES) {
+            ESP_LOGW(TAG, "Wi-Fi falhou %u vezes; abrindo portal", wifi_retry_count);
+            enter_portal_mode();
+            return;
         }
-
+        ESP_LOGW(TAG, "WIFI_DISCONNECTED -> tentativa %u/%u", wifi_retry_count, WIFI_MAX_RETRIES);
+        if (client) esp_websocket_client_stop(client);
         ws_started = false;
         ws_connected = false;
         app_set_state(APP_IDLE);
-
         esp_wifi_connect();
         return;
     }
@@ -870,41 +945,38 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 static void on_got_ip(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+    wifi_retry_count = 0;
     ESP_LOGI(TAG, "IP: " IPSTR, IP2STR(&event->ip_info.ip));
 
-    if (!ws_started) {
-        vTaskDelay(pdMS_TO_TICKS(300));
+    if (!ws_started && client) {
+        log_tls_memory("before websocket");
         ESP_LOGI(TAG, "Starting WebSocket...");
         esp_websocket_client_start(client);
         ws_started = true;
     }
 }
 
-static void wifi_init(void)
+static void wifi_stack_init(void)
 {
-    
-
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
-
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &on_got_ip, NULL));
-
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+}
 
-    wifi_config_t wifi_config = {0};
-    strcpy((char *)wifi_config.sta.ssid, WIFI_SSID);
-    strcpy((char *)wifi_config.sta.password, WIFI_PASS);
+static void wifi_start_station(void)
+{
+    wifi_config_t wifi_config = {};
+    strlcpy(reinterpret_cast<char *>(wifi_config.sta.ssid), runtime_config.wifi_ssid, sizeof(wifi_config.sta.ssid));
+    strlcpy(reinterpret_cast<char *>(wifi_config.sta.password), runtime_config.wifi_password, sizeof(wifi_config.sta.password));
     wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "WiFi init OK");
-    
+    ESP_LOGI(TAG, "WiFi station init OK");
 }
 
 // =================== I2S INIT ===================
@@ -1053,14 +1125,19 @@ extern "C" void app_main(void)
     // Display (SECUNDÁRIO - agora é apenas API)
     display_init();
 
-    eye_set_text("Iniciando...");
+    eye_set_text("Iniciando");
+    eye_set_status("CONECTANDO");
 
     
 
-    // Wi-Fi
-    wifi_init();
+    wifi_stack_init();
+    if (!device_config_load(&runtime_config)) {
+        ESP_LOGW(TAG, "Configuracao ausente; abrindo portal local");
+        enter_portal_mode();
+        return;
+    }
 
-    // WebSocket
+    // WebSocket is configured only from NVS-backed credentials.
     esp_websocket_client_config_t ws_cfg = {0};
     ws_cfg.uri = REALTIME_URI;
     ws_cfg.buffer_size = 16384;
@@ -1070,13 +1147,17 @@ extern "C" void app_main(void)
     ws_cfg.transport = WEBSOCKET_TRANSPORT_OVER_SSL;
     ws_cfg.disable_auto_reconnect = false;
     ws_cfg.crt_bundle_attach = esp_crt_bundle_attach;
-
-    ws_cfg.headers =
-        "Authorization: Bearer " OPENAI_KEY "\r\n"
-        "OpenAI-Beta: realtime=v1\r\n";
+    snprintf(websocket_headers, sizeof(websocket_headers),
+             "Authorization: Bearer %s\x0d\x0a",
+             runtime_config.openai_api_key);
+    ws_cfg.headers = websocket_headers;
 
     client = esp_websocket_client_init(&ws_cfg);
+    ESP_ERROR_CHECK(client == NULL ? ESP_FAIL : ESP_OK);
     esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY, ws_event_handler, NULL);
+
+    // Wi-Fi station starts only after the WebSocket has a valid NVS API key.
+    wifi_start_station();
 
     // I2S
     i2s_init_mic_and_pdm_tx();
@@ -1108,7 +1189,7 @@ extern "C" void app_main(void)
     // Loop
     while (true) {
         // Só pra você ver o estado vivo
-        ESP_LOGI(TAG, "alive | ws=%d | state=%d | model_speaking=%d | user_speaking=%d -> RMS=%ld ", ws_connected, (int)app_state, model_speaking, user_speaking, rms);
+        ESP_LOGI(TAG, "alive | ws=%d | session=%d | state=%d | model=%d | user=%d | cap=%" PRIu32 " queued=%" PRIu32 " qdrop=%" PRIu32 " enc=%" PRIu32 " sent=%" PRIu32 " retry=%" PRIu32 " drop=%" PRIu32 " | RMS=%ld", ws_connected, session_ready, (int)app_state, model_speaking, user_speaking, mic_frames_captured, mic_frames_queued, mic_queue_drops, mic_frames_encoded, ws_audio_frames_sent, ws_audio_frames_backpressure, ws_audio_frames_dropped, rms);
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
